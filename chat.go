@@ -1,44 +1,75 @@
 package main
 
 import (
+	"bytes"
 	"log"
 	"net"
+	"strings"
 )
 
-type robustConn struct {
-	conn net.Conn
+type message struct {
+	user string
+	m    string
 }
 
-func (c robustConn) write(b []byte) {
-	t := 0
-	for t < len(b) {
-		// timeout
-		n, err := c.conn.Write(b)
-		t += n
-		if err != nil {
-			log.Println(err)
+type sub struct {
+	user string
+	out  chan message
+}
+
+func clean(b []byte) string {
+	b = bytes.Trim(b, "\x00")
+	s := strings.TrimSpace(string(b))
+	return s
+}
+
+func read(conn net.Conn, user string, in chan<- message) {
+	// Error handling and EOF
+	for {
+		b := make([]byte, 256) // TODO learn to zero a buffer
+		_, e := conn.Read(b)
+		if e != nil {
+			log.Println("ERROR: ", e)
+			break
+		}
+		in <- message{clean(b), user}
+	}
+}
+
+func subscribe(s chan sub, in chan message) {
+	subs := make([]sub, 0)
+	for {
+		select {
+		case subscriber := <-s:
+			go func() {
+				in <- message{"server", subscriber.user + " logged in"}
+				var us string
+				for _, u := range subs {
+					us += "\n" + u.user
+				}
+				subscriber.out <- message{"server", "Online:" + us}
+				subs = append(subs, subscriber)
+			}()
+		case m := <-in:
+			for _, subscriber := range subs {
+				subscriber.out <- m
+			}
 		}
 	}
 }
 
-func (c robustConn) read() []byte {
-	b := make([]byte, 1e5)
-	//timeout
-	n, err := c.conn.Read(b)
-	if err != nil {
-		log.Println(err)
-	}
-	r := make([]byte, n)
-	copy(r, b)
-	return r
-}
-
-func handle(c robustConn) {
-	w := "Welcome to chat\n"
-	c.write([]byte(w))
-	for {
-		b := c.read()
-		log.Println(string(b))
+func handle(conn net.Conn, in chan<- message, out chan message, subs chan sub) {
+	w := "Welcome to chat!\n"
+	conn.Write([]byte(w))
+	w = "What do you want your nickname to be?\n"
+	conn.Write([]byte(w))
+	b := make([]byte, 16)
+	conn.Read(b)
+	user := clean(b)
+	subs <- sub{user, out}
+	go read(conn, user, in)
+	for m := range out {
+		conn.Write([]byte(m.user + ": " + m.m + "\n"))
 	}
 }
 
@@ -49,12 +80,15 @@ func main() {
 	if err != nil {
 		log.Fatal("Couldn't listen on %s:\n%s", port, err)
 	}
+	in := make(chan message)
+	s := make(chan sub)
+	go subscribe(s, in)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Println(err)
 		}
-		c := robustConn{conn}
-		go handle(c)
+		out := make(chan message)
+		go handle(conn, in, out, s)
 	}
 }
